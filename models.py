@@ -1,6 +1,6 @@
 import keras
 from keras.models import Model, Sequential
-from keras.layers import Input, Dense, Conv1D, MaxPooling1D, Flatten, Embedding, Lambda, RepeatVector, Merge
+from keras.layers import Input, Dense, Conv1D, MaxPooling1D, AveragePooling1D, Flatten, Embedding, Lambda, RepeatVector, Merge
 from keras.layers.merge import Add, Multiply, Dot, Concatenate
 from keras import regularizers
 from keras import backend as K
@@ -22,6 +22,9 @@ from keras import backend as K
 # USELESS
 def simplex_reg(weight_matrix):
 	return 0.01 * (K.abs(K.sum(weight_matrix) - 1.))
+
+def to_one(m):
+	return lambda x: (m * (K.sum(K.abs(x - 1.))))
 
 def ErrorLayer_BK(v1, v2):
 	return keras.layers.merge([v1, v2], mode='cos')
@@ -62,27 +65,14 @@ def create_nlds_model(user_size, item_size, hidden_size, output_embedding_size):
 	hiddenI = Dense(output_embedding_size, activation=None, name="inferred_embedding")(inputI) # linear activation for embeddings
 	errorIE = ErrorLayer(hiddenI, inputE)
 	HIDDEN_SIZE_1 = 1
-	hiddenU = Dense(HIDDEN_SIZE_1, activation='sigmoid', use_bias=False, activity_regularizer=regularizers.l1(.001))(inputU) # user vars represent added noise! 0 is good. like An's work (use tanh?)
-	# regularizer weight of 0.001 seems to work well... (typical errorIE is about 0.02-0.04)
+	hiddenU = Dense(HIDDEN_SIZE_1, activation='sigmoid', use_bias=False, activity_regularizer=to_one(0.001))(inputU) # user vars represent added noise! 0 is good. like An's work (use tanh?)
 	errorU = RepeatVector(output_embedding_size)(hiddenU)
 	errorU = Flatten(name = 'user_noise')(errorU)
 
-	output = Lambda(lambda x: x[0] * (1 - x[1]), name="output")([errorIE, errorU])
+	# output = Lambda(lambda x: K.multiply(x[0], (1 - x[1])), name="output")([errorIE, errorU])
+	output = Multiply(name="output")([errorIE, errorU])
 
 	model = Model(inputs=[inputU, inputI, inputE], outputs=[output])
-	model.compile(optimizer='adam', loss='mse')
-	return model
-
-def create_nlds_model_BK(user_size, item_size, hidden_size, output_embedding_size, extra=True):
-	inputU = Input(shape=(user_size,))
-	inputI = Input(shape=(item_size,))
-	hiddenU = Dense(hidden_size, activation='sigmoid', use_bias=False, activity_regularizer=regularizers.l1(.01))(inputU) # user vars represent added noise! 0 is good. like An's work (use tanh?)
-	if extra:
-		hiddenU = Concatenate()([hiddenU, inputI])
-	hiddenI = Dense(output_embedding_size, activation=None)(inputI) # linear activation for embeddings
-	noise = Dense(output_embedding_size, activation=None, use_bias=False, activity_regularizer=regularizers.l1(.01))(hiddenU) # noise added to 'true' embedding to get observed one
-	output = Add()([hiddenI, noise])
-	model = Model(inputs=[inputU, inputI], outputs=[output])
 	model.compile(optimizer='adam', loss='mse')
 	return model
 
@@ -97,24 +87,34 @@ def create_aspect_model(user_size, item_size, hidden_size, output_embedding_size
 	model.compile(optimizer='adam', loss='mse')
 	return model
 
+def create_factorization_model(user_size, item_size, hidden_size):
+	inputU = Input(shape=(user_size,))
+	inputI = Input(shape=(item_size,))
+	hiddenU = Dense(hidden_size)(inputU)
+	hiddenI = Dense(hidden_size)(inputI)
+	dotproduct = Dot(axes=1)([hiddenU, hiddenI])
+	model = Model(inputs=[inputU, inputI], outputs=[dotproduct])
+	model.compile(optimizer='adam', loss='mse')
+	return model
+
 class DeepCoNN():
-	def __init__(self, embedding_size, hidden_size, max_seq_len, filters=100, kernel_size=3):
+	# def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=100, kernel_size=3, strides=1):
+	def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=2, kernel_size=8, strides=6):
 		self.embedding_size = embedding_size
 		self.hidden_size = hidden_size
-		self.max_seq_len = max_seq_len
 		self.filters = filters
 		self.kernel_size = kernel_size
-		self.inputU, self.towerU = self.create_deepconn_tower()
-		self.inputI, self.towerI = self.create_deepconn_tower()
+		self.inputU, self.towerU = self.create_deepconn_tower(u_seq_len)
+		self.inputI, self.towerI = self.create_deepconn_tower(i_seq_len)
 		self.joined = Concatenate()([self.towerU, self.towerI])
-		self.outNeuron = output = Dense(1)(self.joined)
+		self.outNeuron = Dense(1)(self.joined)
 
-	def create_deepconn_tower(self):
-		input_layer = Input(shape=(self.max_seq_len, self.embedding_size))
-		tower = Conv1D(filters=self.filters, kernel_size=self.kernel_size)(input_layer)
+	def create_deepconn_tower(self, max_seq_len):
+		input_layer = Input(shape=(max_seq_len, self.embedding_size))
+		tower = Conv1D(filters=self.filters, kernel_size=self.kernel_size, activation="relu")(input_layer)
 		tower = MaxPooling1D()(tower)
 		tower = Flatten()(tower)
-		tower = Dense(self.hidden_size)(tower) # wait so linear activations??
+		tower = Dense(self.hidden_size, activation="relu")(tower)
 		return input_layer, tower
 
 	def create_1st_order_only(self):
@@ -123,6 +123,27 @@ class DeepCoNN():
 		return model
 
 	def create_deepconn_dp(self):
+		dotproduct = Dot(axes=1)([self.towerU, self.towerI])
+		output = Add()([self.outNeuron, dotproduct])
+		model = Model(inputs=[self.inputU, self.inputI], outputs=[output])
+		model.compile(optimizer='adam', loss='mse')
+		return model
+
+class DerpCon():
+	def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len):
+		self.embedding_size = embedding_size
+		self.hidden_size = hidden_size
+		self.inputU, self.towerU = self.create_derpcon_tower(u_seq_len)
+		self.inputI, self.towerI = self.create_derpcon_tower(i_seq_len)
+		self.joined = Concatenate()([self.towerU, self.towerI])
+		self.outNeuron = output = Dense(1)(self.joined)
+	def create_derpcon_tower(self, max_seq_len):
+		input_layer = Input(shape=(max_seq_len, self.embedding_size))
+		tower = AveragePooling1D(pool_size=max_seq_len)(input_layer)
+		tower = Flatten()(tower)
+		tower = Dense(self.hidden_size, activation="relu")(tower)
+		return input_layer, tower
+	def create_derpcon_dp(self):
 		dotproduct = Dot(axes=1)([self.towerU, self.towerI])
 		output = Add()([self.outNeuron, dotproduct])
 		model = Model(inputs=[self.inputU, self.inputI], outputs=[output])

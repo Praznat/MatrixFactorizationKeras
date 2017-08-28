@@ -2,9 +2,9 @@ import sys
 import json
 import numpy as np
 import pickle
-import matplotlib.pyplot as plt
+from collections import defaultdict
+from densesubgraphfinder import DenseSubgraphFinder
 from sklearn.feature_extraction import DictVectorizer
-from scipy import spatial
 
 from keras.preprocessing.text import text_to_word_sequence
 
@@ -44,7 +44,26 @@ def initEmbeddingMap(fileName='embeddingDict.p'):
 		pickle.dump(embedding_map, open(fileName,'wb'))
 	return embedding_map
 
-def initRawData(input_file, maxlines = sys.maxsize, fileName='rawData.p', save=True):
+class SparcityTarget():
+	def __init__(self, n_reviews):
+		self.n_reviews = n_reviews
+		self.dsf = DenseSubgraphFinder()
+	def update(self, user, item):
+		self.dsf.addEdge(user, item)
+	def filter(self, rawInputData, rawOutputData):
+		self.dsf.purge(self.n_reviews)
+		filteredInput = []
+		filteredOutput = []
+		for i in range(len(rawInputData)):
+			in_datum = rawInputData[i]
+			if in_datum['u'] in self.dsf.nodes and in_datum['asin'] in self.dsf.nodes:
+				filteredInput.append(in_datum)
+				filteredOutput.append(rawOutputData[i])
+		return filteredInput, filteredOutput
+	def __str__(self):
+		return str(self.dsf)
+
+def initRawData(input_file, maxlines = sys.maxsize, sparcity_target = None, fileName='rawData.p', save=True):
 	try:
 		rawInputData, rawOutputData = pickle.load(open(fileName,'rb'))
 		print('loaded saved raw data')
@@ -58,10 +77,16 @@ def initRawData(input_file, maxlines = sys.maxsize, fileName='rawData.p', save=T
 				if len(line) < 4:
 					break
 				lineObj = json.loads(line)
-				rawInputDataObj = {'u':lineObj['reviewerID'], 'asin':lineObj['asin']}
+				user = lineObj['reviewerID']
+				item = lineObj['asin']
+				rawInputDataObj = {'u':user, 'asin':item}
 				rawOutputDataObj = clean(lineObj['reviewText'])
 				rawInputData.append(rawInputDataObj)
 				rawOutputData.append(rawOutputDataObj)
+				if sparcity_target is not None:
+					sparcity_target.update(user, item)
+		if sparcity_target is not None:
+			rawInputData, rawOutputData = sparcity_target.filter(rawInputData, rawOutputData)
 		if save:
 			pickle.dump((rawInputData, rawOutputData), open(fileName,'wb'))
 	return rawInputData, rawOutputData
@@ -71,6 +96,16 @@ def getSetFromData(key, data):
 	for datum in data:
 		result.add(datum.get(key))
 	return result
+
+def getSparcityInfo(inputData):
+	users = {}
+	items = {}
+	for datum in inputData:
+		u = datum['u']
+		i = datum['asin']
+		users.setdefault(u, []).append(i)
+		items.setdefault(i, []).append(u)
+	return (users, items)
 
 def initVecData(rawInputData, rawOutputData, embedding_map, fileName='vecData.p', save=True):
 	try:
@@ -85,7 +120,7 @@ def initVecData(rawInputData, rawOutputData, embedding_map, fileName='vecData.p'
 			pickle.dump((vecInputData, vecOutputData), open(fileName,'wb'))
 	return vecInputData, vecOutputData
 
-def initMatInputData(rawInputData, rawOutputData, embedding_map, fileName='matData.p', save=True):
+def initMatInputData(rawInputData, rawOutputData, embedding_map, fileName='matData.p', save=True, extra_info={}):
 	try:
 		matUserInputData, matItemInputData = pickle.load(open(fileName,'rb'))
 		print('loaded saved matrix data')
@@ -107,6 +142,8 @@ def initMatInputData(rawInputData, rawOutputData, embedding_map, fileName='matDa
 		matItemInputData = []
 		users = {k: np.vstack(v) for k, v in users.items()}
 		items = {k: np.vstack(v) for k, v in items.items()}
+		extra_info['user_seq_sizes'] = [m.shape[0] for m in users.values()]
+		extra_info['item_seq_sizes'] = [m.shape[0] for m in items.values()]
 		for i in range(len(rawInputData)):
 			rawInput = rawInputData[i]
 			user = rawInput['u']
@@ -140,13 +177,13 @@ def initRatingsOutputData(rawInputData, input_file, maxlines = sys.maxsize, file
 				terms = line.split(',')
 				user = terms[0]
 				item = terms[1]
-				rating = float(terms[2])
+				rating = float(terms[2]) / 2.5 - 1.0
 				i = userItemDict.get(toKey(user, item))
 				if i is not None:
 					ratingsData[i] = rating
 			failure = None in ratingsData
 			if failure:
-				raise ValueError("Some reviews did not have corresponding rating.")
+				raise ValueError(str(len([r for r in ratingsData if r is None])) + " reviews did not have corresponding rating.")
 		if save:
 			pickle.dump(ratingsData, open(fileName,'wb'))
 	return ratingsData

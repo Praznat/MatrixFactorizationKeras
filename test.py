@@ -14,12 +14,18 @@ catItems = np.argmax(vecItems, axis=1)
 
 matUserInputData, matItemInputData = utils.initMatInputData(rawInputData, rawOutputData, embedding_map)
 ratingsData = utils.initRatingsOutputData(rawInputData, input_file='sanity_ratings.csv', maxlines=500, save=False)
+# print(matUserInputData)
+for m in matUserInputData:
+	print(m.shape)
+
+exit()
 
 import models
 import experiments
 
 # experiments.user_item_to_embedding(vecInputData, vecOutputData)
 # experiments.natlang_u_agnostic(vecItems, vecOutputData, sanity=False)
-experiments.natlang_dawidskene(vecUsers, vecItems, vecOutputData)
+# experiments.natlang_dawidskene(vecUsers, vecItems, vecOutputData)
+experiments.natlang_dawidskene_mc(vecUsers, vecItems, vecOutputData)
 
 # experiments.deepconn_1st_order(matUserInputData, matItemInputData, ratingsData, epochs=500)
