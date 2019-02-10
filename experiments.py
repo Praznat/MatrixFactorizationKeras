@@ -1,5 +1,4 @@
 import models
-import models_mcmc
 import utils
 import numpy as np
 import keras
@@ -10,150 +9,185 @@ from keras import metrics
 from keras import backend as K
 from keras.callbacks import EarlyStopping
 
-def evaluate(model, train_inputs, train_outputs, test_inputs, test_outputs):
+jitter = lambda x : np.random.normal(x, np.std(x)/10)
+mse = lambda x, y: np.mean((x - y) ** 2)
+rmse = lambda x, y: np.sqrt(mse(x, y))
+
+BATCH_SIZE = 64
+
+def evaluate(model, train_inputs, train_outputs, test_inputs, test_outputs, output_i=None, csvname=None,
+	metrics=["baseline_train_mse", "model_train_mse", "baseline_test_mse", "model_test_mse",
+	"model_test_peruser_mse", "model_test_corr"]):
 	model_train_mse = model.evaluate(train_inputs, train_outputs, verbose=0)
-	print(test_outputs)
-	baseline = np.mean(train_outputs)
-	baseline_train_mse = np.mean((baseline - train_outputs) ** 2)
-	print("baseline train mse: " + str(baseline_train_mse))
-	print("model train mse: " + str(model_train_mse))
-
-	model_test_mse = model.evaluate(test_inputs, test_outputs, verbose=1, batch_size=len(test_outputs))
-	baseline_test_mse = np.mean((baseline - test_outputs) ** 2)
-	print("baseline test mse: " + str(baseline_test_mse))
-	print("model test mse: " + str(model_test_mse))
-
-	jitter = lambda x : np.random.normal(x, np.std(x)/10)
-
+	batchsize = len(test_outputs) if output_i is None else len(test_outputs[output_i])
+	model_test_mse = model.evaluate(test_inputs, test_outputs, verbose=1, batch_size=batchsize)
 	predictions = model.predict(test_inputs, verbose=0)
-	tf_session = K.get_session()
-	print(np.mean(metrics.mean_squared_error(predictions, test_outputs).eval(session=tf_session)))
-	print(np.mean((predictions - test_outputs) ** 2))
-	plt.scatter(jitter(predictions), jitter(test_outputs))
-	plt.show()
+	if output_i is not None:
+		train_outputs = train_outputs[output_i]
+		test_outputs = test_outputs[output_i]
+		predictions = predictions[output_i]
+		model_train_mse = model_train_mse[1 + output_i]
+		model_test_mse = model_test_mse[1 + output_i]
+	predictions = predictions.reshape(len(predictions))
+	train_outputs = np.array(train_outputs).reshape(len(train_outputs))
+	test_outputs = np.array(test_outputs).reshape(len(test_outputs))
 
-def user_item_to_embedding(vecInputData, vecOutputData, hidden_size=4, epochs=3500):
-	input_dimensionality = vecInputData.shape[1]
-	embedding_dimensionality = vecOutputData[0].shape[0]
+	results = {}
 
-	inputs = np.asarray(vecInputData)
-	outputs = np.asarray(vecOutputData)
-	trainingN = 13
-	# diagnostics.display_wordvecs(outputs)
-	# diagnostics.display_wordvecs_similarity(outputs)
+	if "baseline_train_mse" in metrics:
+		baseline = np.mean(train_outputs, axis=0)
+		results["baseline_train_mse"] = mse(baseline, train_outputs)
 
-	model = models.create_dumb_model(input_dimensionality, hidden_size, embedding_dimensionality)
+	if "baseline_test_mse" in metrics:
+		results["baseline_test_mse"] = mse(baseline, test_outputs)
 
-	baseline = np.mean(outputs[:trainingN], 0)
-	baseline_train_mse = np.mean((baseline - outputs[:trainingN]) ** 2)
-	baseline_test_mse = np.mean((baseline - outputs[trainingN:]) ** 2)
+	if "model_train_mse" in metrics:
+		results["model_train_mse"] = model_train_mse
 
-	model.fit(inputs[:trainingN], outputs[:trainingN], epochs=epochs, batch_size=32, verbose=0)
-	train_score = model.evaluate(inputs[:trainingN], outputs[:trainingN], batch_size=32, verbose=0)
-	test_score = model.evaluate(inputs[trainingN:], outputs[trainingN:], batch_size=32, verbose=0)
+	if "model_test_mse" in metrics:
+		results["model_test_mse"] = model_test_mse
 
-	print("baseline train mse: " + str(baseline_train_mse))
-	print("baseline test mse: " + str(baseline_test_mse))
-	print("model train mse: " + str(train_score))
-	print("model test mse: " + str(test_score))
+	if "model_test_peruser_mse" in metrics:
+		results["model_test_peruser_mse"] = utils.perUserScore(test_inputs[0], predictions, test_outputs)
 
-def natlang_dawidskene(vecUsers, vecItems, vecOutputData, hidden_size=1, epochs=3500):
-	embedding_dimensionality = vecOutputData[0].shape[0]
-	outputs = np.asarray(vecOutputData)
+	if "model_test_corr" in metrics:
+		results["model_test_corr"] = np.corrcoef(predictions, test_outputs)[0,1]
 
-	base_model = models.create_u_agnostic_model_sane(vecItems.shape[1], embedding_dimensionality)
-	base_model.summary()
-	base_model.fit([vecItems, outputs], outputs, epochs=epochs)
-	init_weights = base_model.layers[1].get_weights()
-	predicted_embedding_avg = diagnostics.get_layer_output(base_model, [0], 1, [vecItems])
+	if csvname:
+		data = np.vstack((predictions, test_outputs))
+		utils.toCsv(np.transpose(data), csvname)
+	# plt.scatter(predictions, jitter(test_outputs))
+	# plt.show()
+	return results
 
-	model = models.create_nlds_model(vecUsers.shape[1], vecItems.shape[1], hidden_size, embedding_dimensionality)
-	model.layers[3].set_weights(init_weights)
+def organize_data(vecUsers, vecItems, vecOutputData, ratingsData, trainingP):
+	trainingN = int(len(ratingsData) * trainingP) if type(trainingP) is float else trainingP
+	embedding_dimensionality = utils.getEmbeddingDim(vecOutputData)
 
-	init_iError = diagnostics.get_layer_output(model, [1, 4], 6, [vecItems, outputs])
-	print(np.mean(init_iError, axis=1))
+	text_train_i, textless_train_i, text_test_i, textless_test_i = [], [], [], []
+	for i in range(trainingN):
+		if vecOutputData[i] is not None:
+			text_train_i.append(i)
+		else:
+			textless_train_i.append(i)
+	for i in range(trainingN, len(vecOutputData)):
+		if vecOutputData[i] is not None:
+			text_test_i.append(i)
+		else:
+			textless_test_i.append(i)
 
-	model.fit([vecUsers, vecItems, outputs], np.zeros((len(outputs), embedding_dimensionality)), epochs=epochs)
+	reshapy = lambda x: np.asarray(list(x))
+
+	D = {}
+	D['textless_train_inputs'] = [vecUsers[textless_train_i], vecItems[textless_train_i]]
+	D['textless_train_outputs'] = [ratingsData[textless_train_i]]
+	D['text_train_inputs'] = [vecUsers[text_train_i], vecItems[text_train_i]]
+	D['text_train_outputs'] = [reshapy(vecOutputData[text_train_i]), ratingsData[text_train_i]]
+	D['textless_test_inputs'] = [vecUsers[textless_test_i], vecItems[textless_test_i]]
+	D['textless_test_outputs'] = [ratingsData[textless_test_i]]
+	D['text_test_inputs'] = [vecUsers[text_test_i], vecItems[text_test_i]]
+	D['text_test_outputs'] = [reshapy(vecOutputData[text_test_i]), ratingsData[text_test_i]]
+
+	return D
+
+def embedding_rating_joint(vecUsers, vecItems, vecOutputData, ratingsData, trainingP, hidden_size=8, epochs=3500,
+	activations=["tanh", "tanh"], **kwargs):
+	embedding_dimensionality = utils.getEmbeddingDim(vecOutputData)
+	vecOutputData = np.asarray(vecOutputData)
+	ratingsData = np.asarray(ratingsData)
+	model, model_textless = models.create_joint_model(vecUsers.shape[1], vecItems.shape[1], hidden_size, embedding_dimensionality, activations=activations, **kwargs)
+
+	D = organize_data(vecUsers, vecItems, vecOutputData, ratingsData, trainingP)
+	
 	model.summary()
-	print(model.layers[2].get_weights())
-	uNoise = diagnostics.get_layer_output(model, [0], 2, [vecUsers])
-	print(uNoise)
-	predicted_embedding = diagnostics.get_layer_output(model, [1], 3, [vecItems])
-	iError = diagnostics.get_layer_output(model, [1, 4], 6, [vecItems, outputs])
-	print(np.mean(iError, axis=1))
-	diagnostics.display_wordvecs_sqeuclidean(outputs, predicted_embedding_avg)
-	diagnostics.display_wordvecs_sqeuclidean(outputs, predicted_embedding)
 
-def natlang_dawidskene_mc(vecUsers, vecItems, vecOutputData, hidden_size=1, epochs=2000, tune=1000):
-	embedding_dimensionality = vecOutputData[0].shape[0]
-	outputs = np.asarray(vecOutputData)
-	model = models_mcmc.NLDSModelMC(vecUsers.shape[1], vecItems.shape[1], hidden_size, embedding_dimensionality)
-	model.fit(vecUsers, vecItems, outputs, epochs, tune)
+	early_stopping = EarlyStopping(monitor='loss', patience=4)
+	early_stopping_val = EarlyStopping(monitor='val_loss', patience=8)
+	batch_size = BATCH_SIZE
+	model.fit(D['text_train_inputs'], D['text_train_outputs'], validation_split=0.2, callbacks=[early_stopping, early_stopping_val], batch_size=batch_size, epochs=epochs)
+	
+	evaluation = evaluate(model, D['text_train_inputs'], D['text_train_outputs'], D['text_test_inputs'], D['text_test_outputs'], output_i=1, csvname="embjoint")
+	
+	user_hidden = diagnostics.get_layer_output(model, ["user_1hot", "item_1hot"], "user_hidden", D['text_train_inputs'])
+	item_hidden = diagnostics.get_layer_output(model, ["user_1hot", "item_1hot"], "item_hidden", D['text_train_inputs'])
+	features = diagnostics.get_layer_output(model, ["user_1hot", "item_1hot"], "features", D['text_train_inputs'])
+	# for i in range(len(features)):
+	# 	print(str(user_hidden[i]) + " * " + str(item_hidden[i]))
+	# 	print(features[i])
+	return evaluation, user_hidden, item_hidden, features
 
-def natlang_u_agnostic(vecItems, vecOutputData, epochs=2000, sanity=True):
-	embedding_dimensionality = vecOutputData[0].shape[0]
-	outputs = np.asarray(vecOutputData)
-	model = None
-	if sanity:
-		model = models.create_u_agnostic_model_sane(vecItems.shape[1], embedding_dimensionality)
-		model.fit([vecItems, outputs], outputs, epochs=epochs)
-	else:
-		model = models.create_u_agnostic_model(vecItems.shape[1], embedding_dimensionality)
-		model.fit([vecItems, outputs], np.zeros((len(outputs), embedding_dimensionality)), epochs=epochs)
-	print(model.summary())
-	predicted_embedding = diagnostics.get_layer_output(model, [0,2], 1, [vecItems])
-	iError = diagnostics.get_layer_output(model, [0,2], 3, [vecItems, outputs])
-	print(e(predicted_embedding))
-	print("***")
-	print(e(outputs))
-	print(np.mean(iError, axis=1)) # TODO these norms arent good indicator of error
-	diagnostics.display_wordvecs_similarity(outputs, predicted_embedding)
-
-def matrix_factorization(vecUsers, vecItems, ratingsData, hidden_size=4, epochs=3500, training=0.8):
-	model = models.create_factorization_model(vecUsers.shape[1], vecItems.shape[1], hidden_size)
-
-	trainingN = int(len(ratingsData) * training) if type(training) is float else training
+def matrix_factorization(vecUsers, vecItems, ratingsData, trainingP, hidden_size=4, epochs=3500, **kwargs):
+	trainingN = int(len(ratingsData) * trainingP) if type(trainingP) is float else trainingP
 
 	train_inputs = [vecUsers[:trainingN], vecItems[:trainingN]]
 	train_outputs = ratingsData[:trainingN]
 	test_inputs = [vecUsers[trainingN:], vecItems[trainingN:]]
 	test_outputs = ratingsData[trainingN:]
-	print(model.summary())
 
-	early_stopping = EarlyStopping(monitor='loss', patience=8)
-	early_stopping_val = EarlyStopping(monitor='val_loss', patience=12)
-	batch_size = 32
-	model.fit(train_inputs, train_outputs, validation_split=0.2, callbacks=[early_stopping, early_stopping_val], batch_size=batch_size, epochs=epochs)
-	evaluate(model, train_inputs, train_outputs, test_inputs, test_outputs)
+	nzUsers_train = np.nonzero(train_inputs[0])[1]
+	nzUsers_test = np.nonzero(test_inputs[0])[1]
+	trainUsers = set(nzUsers_train)
+	testUsers = set(nzUsers_test)
+	pctTestDataAreUsersSeenInTraining = np.mean([u in trainUsers for u in nzUsers_test])
+	print("pctTestDataAreUsersSeenInTraining " + str(pctTestDataAreUsersSeenInTraining))
 
+	nzItems_train = np.nonzero(train_inputs[1])[1]
+	nzItems_test = np.nonzero(test_inputs[1])[1]
+	trainItems = set(nzItems_train)
+	testItems = set(nzItems_test)
+	pctTestDataAreItemsSeenInTraining = np.mean([u in trainItems for u in nzItems_test])
+	print("pctTestDataAreItemsSeenInTraining " + str(pctTestDataAreItemsSeenInTraining))
 
-def deepconn_1st_order(matUserInputData, matItemInputData, ratingsData, u_seq_len=200, i_seq_len=200, hidden_size=4, epochs=3500, training=None):
-	embedding_dimensionality = matUserInputData[0].shape[1]
+	model = models.create_factorization_model(vecUsers.shape[1], vecItems.shape[1], hidden_size, **kwargs)
+	model.summary()
+	result = matrix_factorization_simple(model, train_inputs, train_outputs, test_inputs, test_outputs, epochs)
+
+	if hidden_size:
+		user_hidden = diagnostics.get_layer_output(model, ["user_1hot", "item_1hot"], "user_hidden", train_inputs)
+		item_hidden = diagnostics.get_layer_output(model, ["user_1hot", "item_1hot"], "item_hidden", train_inputs)
+		for i in range(min(100,len(user_hidden))):
+			print(str(user_hidden[i]) + "	" + str(item_hidden[i]))
+
+	return result
+
+def matrix_factorization_simple(model, train_inputs, train_outputs, test_inputs, test_outputs, epochs=3500):
+	callbacks = [EarlyStopping(monitor='loss', patience=3), EarlyStopping(monitor='val_loss', patience=6)]
+	batch_size = BATCH_SIZE
+	model.fit(train_inputs, train_outputs, validation_split=0.2, callbacks=callbacks, batch_size=batch_size, epochs=epochs)
+	return evaluate(model, train_inputs, train_outputs, test_inputs, test_outputs, csvname="matfact")
+
+def deepconn_1st_order(matUserInputData, matItemInputData, ratingsData, trainingP, u_seq_len=200, i_seq_len=200, hidden_size=4, epochs=3500, derp=False):
+	trainingN = int(len(ratingsData) * trainingP) if type(trainingP) is float else trainingP
+
+	print("Setting up data...")
+	u_mat_train = [mat.get_np_vec(only_training=True) for mat in matUserInputData[:trainingN]]
+	i_mat_train = [mat.get_np_vec(only_training=True) for mat in matItemInputData[:trainingN]]
+	u_mat_test = [mat.get_np_vec(only_training=False) for mat in matUserInputData[trainingN:]]
+	i_mat_test = [mat.get_np_vec(only_training=False) for mat in matItemInputData[trainingN:]]
+
+	embedding_dimensionality = u_mat_train[0].shape[1]
 	deepconn = models.DeepCoNN(embedding_dimensionality, hidden_size, u_seq_len, i_seq_len)
 	derpcon = models.DerpCon(embedding_dimensionality, hidden_size, u_seq_len, i_seq_len)
 
-	model = deepconn.create_deepconn_dp()
-	# model = derpcon.create_derpcon_dp()
+	model = deepconn.create_deepconn_dp() if not derp else derpcon.create_derpcon_dp()
 
-	user_input = keras.preprocessing.sequence.pad_sequences(np.asarray(matUserInputData), maxlen=u_seq_len)
-	item_input = keras.preprocessing.sequence.pad_sequences(np.asarray(matItemInputData), maxlen=i_seq_len)
-	
-	trainingN = int(len(user_input) * training) if type(training) is float else training
+	u_mat_train = keras.preprocessing.sequence.pad_sequences(u_mat_train, maxlen=u_seq_len)
+	i_mat_train = keras.preprocessing.sequence.pad_sequences(i_mat_train, maxlen=i_seq_len)
+	u_mat_test = keras.preprocessing.sequence.pad_sequences(u_mat_test, maxlen=u_seq_len)
+	i_mat_test = keras.preprocessing.sequence.pad_sequences(i_mat_test, maxlen=i_seq_len)
 
-	inputs = [user_input, item_input]
 	outputs = np.asarray(ratingsData)
-	print(model.summary())
+	model.summary()
 
-	train_inputs = [user_input[:trainingN], item_input[:trainingN]]
 	train_outputs = outputs[:trainingN]
-	test_inputs = [user_input[trainingN:], item_input[trainingN:]]
 	test_outputs = outputs[trainingN:]
 
 	early_stopping = EarlyStopping(monitor='loss', patience=4)
 	early_stopping_val = EarlyStopping(monitor='val_loss', patience=6)
-	batch_size = 32
-	model.fit(train_inputs, train_outputs, validation_split=0.2, callbacks=[early_stopping, early_stopping_val], batch_size=batch_size, epochs=epochs)
-	evaluate(model, train_inputs, train_outputs, test_inputs, test_outputs)
+	batch_size = BATCH_SIZE
+	model.fit([u_mat_train, i_mat_train], train_outputs, validation_split=0.2, callbacks=[early_stopping, early_stopping_val], batch_size=batch_size, epochs=epochs)
+	return evaluate(model, [u_mat_train, i_mat_train], train_outputs, [u_mat_test, i_mat_test], test_outputs,
+		metrics=["baseline_train_mse", "model_train_mse", "baseline_test_mse", "model_test_mse", "model_test_corr"])
 
 
 

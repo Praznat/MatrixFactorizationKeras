@@ -1,105 +1,94 @@
 import keras
 from keras.models import Model, Sequential
-from keras.layers import Input, Dense, Conv1D, MaxPooling1D, AveragePooling1D, Flatten, Embedding, Lambda, RepeatVector, Merge
+from keras.layers import Input, Dense, Conv1D, MaxPooling1D, AveragePooling1D, Flatten, Reshape, Embedding, Lambda, RepeatVector, Merge
 from keras.layers.merge import Add, Multiply, Dot, Concatenate
 from keras import regularizers
 from keras import backend as K
 
-# import numpy as np
-# from keras import backend as K
-# tmp1 = np.array([[1,0,1,0,0],[1,0,1,0,0]])
-# tmp2 = np.array([[1,0,0,1,1],[1,0,0,.5,0]])
-# input1 = Input(shape=(5,))
-# input2 = Input(shape=(5,))
-# lamb = Lambda(lambda x: (x[0]-x[1])**2)([input1, input2])
-# model = Model(inputs=[input1, input2], outputs=[lamb])
-# model.compile(optimizer='adam', loss='mse')
-# print(model.summary())
-# get_layer_output_fn = K.function([model.layers[i].input for i in [0,1]], [model.layers[2].output])
-# layer_output = get_layer_output_fn([tmp1,tmp2])
-# print(layer_output)
-
-# USELESS
-def simplex_reg(weight_matrix):
-	return 0.01 * (K.abs(K.sum(weight_matrix) - 1.))
-
 def to_one(m):
 	return lambda x: (m * (K.sum(K.abs(x - 1.))))
 
-def ErrorLayer_BK(v1, v2):
-	return keras.layers.merge([v1, v2], mode='cos')
-
-def ErrorLayer(v1, v2):
-	return Lambda(lambda x: (x[0]-x[1])**2, name="error")([v1, v2])
-
-def create_dumb_model(input_size, hidden_size, output_embedding_size):
-	model = Sequential()
-	model.add(Dense(hidden_size, activation='tanh', input_shape=(input_size,)))
-	model.add(Dense(output_embedding_size)) # activation=None: linear activation
-	model.compile(optimizer='adam', loss='mse')
-	return model
-
-def create_u_agnostic_model(item_size, output_embedding_size):
-	inputI = Input(shape=(item_size,), name="item_1hot")
-	inputE = Input(shape=(output_embedding_size,), name="target_embedding")
-	hiddenI = Dense(output_embedding_size, activation=None, name="inferred_embedding")(inputI) # linear activation for embeddings
-	error = ErrorLayer(hiddenI, inputE)
-	model = Model(inputs=[inputI, inputE], outputs=[error])
-	model.compile(optimizer='adam', loss='mse')
-	return model
-
-def create_u_agnostic_model_sane(item_size, output_embedding_size):
-	inputI = Input(shape=(item_size,), name="item_1hot")
-	inputE = Input(shape=(output_embedding_size,), name="target_embedding")
-	hiddenI = Dense(output_embedding_size, activation=None, name="inferred_embedding")(inputI) # linear activation for embeddings
-	error = ErrorLayer(hiddenI, inputE)
-	output = Lambda(lambda x: x[0], name="output")([hiddenI, error])
-	model = Model(inputs=[inputI, inputE], outputs=[output])
-	model.compile(optimizer='adam', loss='mse')
-	return model
-
-def create_nlds_model(user_size, item_size, hidden_size, output_embedding_size):
-	inputU = Input(shape=(user_size,), name="user_1hot")
-	inputI = Input(shape=(item_size,), name="item_1hot")
-	inputE = Input(shape=(output_embedding_size,), name="target_embedding")
-	hiddenI = Dense(output_embedding_size, activation=None, name="inferred_embedding")(inputI) # linear activation for embeddings
-	errorIE = ErrorLayer(hiddenI, inputE)
-	HIDDEN_SIZE_1 = 1
-	hiddenU = Dense(HIDDEN_SIZE_1, activation='sigmoid', use_bias=False, activity_regularizer=to_one(0.001))(inputU) # user vars represent added noise! 0 is good. like An's work (use tanh?)
-	errorU = RepeatVector(output_embedding_size)(hiddenU)
-	errorU = Flatten(name = 'user_noise')(errorU)
-
-	# output = Lambda(lambda x: K.multiply(x[0], (1 - x[1])), name="output")([errorIE, errorU])
-	output = Multiply(name="output")([errorIE, errorU])
-
-	model = Model(inputs=[inputU, inputI, inputE], outputs=[output])
-	model.compile(optimizer='adam', loss='mse')
-	return model
-
-def create_aspect_model(user_size, item_size, hidden_size, output_embedding_size):
+def create_user_item_model(user_size, item_size):
+	''' same as factorization model with hidden_size=0 '''
 	inputU = Input(shape=(user_size,))
 	inputI = Input(shape=(item_size,))
-	hiddenU = Dense(hidden_size, activation='tanh')(inputU)
-	hiddenI = Dense(hidden_size, activation='tanh')(inputI)
-	aspectVals = Multiply()([hiddenU, hiddenI])
-	output = Dense(output_embedding_size)(aspectVals)
+	output = Dense(1, use_bias=True)(Concatenate()([inputU, inputI]))
 	model = Model(inputs=[inputU, inputI], outputs=[output])
 	model.compile(optimizer='adam', loss='mse')
 	return model
 
-def create_factorization_model(user_size, item_size, hidden_size):
-	inputU = Input(shape=(user_size,))
-	inputI = Input(shape=(item_size,))
-	hiddenU = Dense(hidden_size)(inputU)
-	hiddenI = Dense(hidden_size)(inputI)
-	dotproduct = Dot(axes=1)([hiddenU, hiddenI])
-	model = Model(inputs=[inputU, inputI], outputs=[dotproduct])
+def create_factorization_model(user_size, item_size, hidden_size, **kwargs):
+	''' Basic generalization of matrix factorization models.
+	user_size and item_size are number of users and items, respectively
+	hidden_size determines number of attributes
+	optional arguments:
+	regularization: amount of L2 regularization to apply, none by default
+	activations: vector of activations for user and item hidden layers. default is "linear", use "relu" for non-negative matrix factorization
+	more_complex: learns additional weights for each attribute instead of taking simple dot product. False by default.
+	useIntercepts: whether to use user and item intercepts. common practice, but false by default here
+	squash: if output is bounded, it can help to tell that to the model, but then need to normalize output to fall between 0 and 1. False by default.
+	'''
+	inputU = Input(shape=(user_size,), name="user_1hot")
+	inputI = Input(shape=(item_size,), name="item_1hot")
+	regularization = kwargs.get('regularization')
+	regularizer = regularizers.l2(regularization) if regularization else None
+	if hidden_size:
+		activations = kwargs.get('activations') or ["linear","linear"]
+		print(activations)
+		hiddenU = Dense(hidden_size, activation=activations[0], name="user_hidden", kernel_regularizer=regularizer, use_bias=True)(inputU)
+		hiddenI = Dense(hidden_size, activation=activations[1], name="item_hidden", kernel_regularizer=regularizer, use_bias=True)(inputI)
+		output = Dense(1, kernel_regularizer=to_one(regularization or .01))(Multiply(name="aspect_points")([hiddenU, hiddenI])) if kwargs.get('more_complex') else Dot(axes=1)([hiddenU, hiddenI])
+		if kwargs.get('useIntercepts'):
+			intercept = Dense(1, use_bias=True, kernel_regularizer=regularizer)(Concatenate()([inputU, inputI]))
+			output = Add(name="prediction")([output, intercept])
+	else:
+		output = Dense(1, name="prediction", use_bias=True, kernel_regularizer=regularizer)(Concatenate()([inputU, inputI])) # same as user_item model
+	if kwargs.get('squash'):
+		output = Dense(1)(Dense(1, activation="sigmoid")(output))
+	model = Model(inputs=[inputU, inputI], outputs=[output])
 	model.compile(optimizer='adam', loss='mse')
 	return model
 
+def Sum(inLayer, inLayerSize, name="Sum"):
+	return Flatten()(AveragePooling1D(pool_size=inLayerSize, name=name)(Reshape((inLayerSize,1))(inLayer)))
+
+def create_joint_model(user_size, item_size, hidden_size, output_embedding_size, **kwargs):
+	'''
+	Matrix factorization model regularized by text embedding likelihood (from reviews).
+	user_size and item_size are number of users and items, respectively
+	output_embedding_size is dimensionality of the word vectors (embeddings)
+	hidden_size determines number of attributes
+	optional arguments:
+	activations: vector of activations for user and item hidden layers. default is "linear", use "relu" for non-negative matrix factorization
+	more_complex: learns additional weights for each attribute instead of taking simple dot product. False by default.
+	useIntercepts: whether to use user and item intercepts. common practice, but false by default here
+	squash: if ratings are bounded, it can help to tell that to the model, but then need to normalize ratings to fall between 0 and 1. False by default.
+	'''
+	inputU = Input(shape=(user_size,), name="user_1hot")
+	inputI = Input(shape=(item_size,), name="item_1hot")
+	activations = kwargs.get('activations') or ["linear","linear"]
+	hiddenU = Dense(hidden_size, activation=activations[0], name="user_hidden")(inputU)
+	hiddenI = Dense(hidden_size, activation=activations[1], name="item_hidden")(inputI)
+	aspectVals = Multiply(name="aspect_points")([hiddenU, hiddenI])
+	h = hidden_size
+	if kwargs.get('useIntercepts'):
+		intercept = Dense(1, use_bias=False, name="intercept")(Concatenate()([inputU, inputI]))
+		aspectVals = Concatenate(name="features")([aspectVals, intercept])
+		h += 1
+	embedding = Dense(output_embedding_size, name="embedding")(aspectVals)
+	rating = Dense(1)(aspectVals, name="rating") if kwargs.get('more_complex') else Sum(aspectVals, h, "rating")
+	if kwargs.get('squash'):
+		rating = Dense(1)(Dense(1, activation="sigmoid")(rating))
+	model = Model(inputs=[inputU, inputI], outputs=[embedding, rating])
+	model_textless = Model(inputs=[inputU, inputI], outputs=[rating])
+	model.compile(optimizer='adam', loss='mse')
+	model_textless.compile(optimizer='adam', loss='mse')
+	return model, model_textless
+
 class DeepCoNN():
-	# def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=100, kernel_size=3, strides=1):
-	def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=2, kernel_size=8, strides=6):
+	''' DeepCoNN text-based factorization model as described in the paper '''
+	# def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=100, kernel_size=3, strides=1): # original DeepCoNN paper settings
+	def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len, filters=2, kernel_size=3, strides=6):
 		self.embedding_size = embedding_size
 		self.hidden_size = hidden_size
 		self.filters = filters
@@ -123,6 +112,9 @@ class DeepCoNN():
 		return model
 
 	def create_deepconn_dp(self):
+		''' simple dot product instead of factorization machine for final layer.
+		this simplification yielded similar results in the paper and should work
+		better on small data due to less overfitting. '''
 		dotproduct = Dot(axes=1)([self.towerU, self.towerI])
 		output = Add()([self.outNeuron, dotproduct])
 		model = Model(inputs=[self.inputU, self.inputI], outputs=[output])
@@ -130,6 +122,7 @@ class DeepCoNN():
 		return model
 
 class DerpCon():
+	''' similar to DeepCoNN, except simpler: uses average embeddings in place of learning a CNN '''
 	def __init__(self, embedding_size, hidden_size, u_seq_len, i_seq_len):
 		self.embedding_size = embedding_size
 		self.hidden_size = hidden_size
